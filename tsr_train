@@ -1,0 +1,232 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageFile
+from transformers import (
+    VisionEncoderDecoderModel,
+    ViTImageProcessor,
+    BertTokenizer,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    EvalPrediction
+)
+import os
+from pathlib import Path
+import warnings
+import sacrebleu  
+from typing import Optional, Dict, Any
+import logging 
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(level=logging.INFO)
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# 1. Configuration
+class Config:
+    ROOT_DIR = Path("C:/Users/ahmed/Desktop/Ahmed Sajid/Office - NCV/NCV - HTR/TableBank/Recognition")
+    IMAGE_DIR = ROOT_DIR / "Images"
+    ANNOTATION_DIR = ROOT_DIR / "Annotations"
+    
+    # Model checkpoints
+    ENCODER_MODEL = "google/vit-base-patch16-224-in21k"
+    DECODER_MODEL = "bert-base-uncased"
+    
+    # Training params
+    NUM_EPOCHS = 5
+    BATCH_SIZE = 16 
+    LEARNING_RATE = 1e-3
+    
+    # Gradient accumulation steps
+    GRAD_ACCUMULATION_STEPS = 4 
+    
+    # Data splits 
+    TRAIN_SIZE = 20000
+    VAL_SIZE = 1000
+    TEST_SIZE = 5000
+    
+    # Model output
+    MODEL_OUTPUT_DIR = "tsr_vit_tablebank"
+    
+    # Checkpoint Configuration 
+    CHECKPOINT_DIR = "tsr_vit_tablebank_checkpoints" 
+    RESUME_FROM_CHECKPOINT: Optional[str] = None 
+
+# 2. Custom Dataset 
+class TableBankDataset(Dataset):
+    def __init__(self, config, split="train"):
+        self.config = config
+        self.split = split
+        self.image_paths = []
+        self.html_strings = []
+
+        src_file = config.ANNOTATION_DIR / f"src-all_{split}.txt"
+        tgt_file = config.ANNOTATION_DIR / f"tgt-all_{split}.txt"
+
+        try:
+            with open(src_file, 'r', encoding='utf-8') as f:
+                all_image_paths = [line.strip() for line in f.readlines()]
+                
+            with open(tgt_file, 'r', encoding='utf-8') as f:
+                all_html_strings = [line.strip() for line in f.readlines()]
+        except FileNotFoundError as e:
+            print(f"Error: Annotation file not found. {e}")
+            raise
+        
+        assert len(all_image_paths) == len(all_html_strings), \
+            "Mismatch between image file list and HTML content list."
+
+        if split == "train":
+            size_limit = min(config.TRAIN_SIZE, len(all_image_paths))
+        elif split == "val":
+            size_limit = min(config.VAL_SIZE, len(all_image_paths))
+        elif split == "test":
+            size_limit = min(config.TEST_SIZE, len(all_image_paths))
+        else:
+            size_limit = len(all_image_paths)
+            
+        self.image_paths = all_image_paths[:size_limit]
+        self.html_strings = all_html_strings[:size_limit]
+        
+        print(f"{split.upper()} set: {len(self.image_paths)} images")
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+        image_name = self.image_paths[idx]
+        image_path = self.config.IMAGE_DIR / image_name
+        try:
+            image = Image.open(image_path).convert("RGB")
+        except (FileNotFoundError, OSError, Image.DecompressionBombError) as e:
+            print(f"Warning: Could not load image {image_path}. Error: {e}. Skipping.")
+            return None 
+            
+        html_str = self.html_strings[idx]
+        return {"image": image, "html_str": html_str}
+
+# 3. Custom Collate Function 
+def collate_fn(batch, image_processor, tokenizer):
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return {} 
+
+    images = [item['image'] for item in batch]
+    html_strs = [item['html_str'] for item in batch]
+    
+    pixel_values = image_processor(images=images, return_tensors="pt").pixel_values
+    
+    tokenized_text = tokenizer(
+        html_strs, padding="longest", truncation=True, max_length=512, return_tensors="pt"
+    )
+    
+    labels = tokenized_text.input_ids.clone()
+    labels[labels == tokenizer.pad_token_id] = -100 
+    
+    return {
+        "pixel_values": pixel_values,
+        "labels": labels,
+        "decoder_attention_mask": tokenized_text.attention_mask
+    }
+
+# 4. Evaluation Metrics Function
+def compute_metrics(pred: EvalPrediction, tokenizer: BertTokenizer) -> Dict[str, float]:
+    preds_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    label_ids[label_ids == -100] = tokenizer.pad_token_id
+
+    pred_str = tokenizer.batch_decode(preds_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    label_str = [[label] for label in label_str]
+
+    bleu = sacrebleu.corpus_bleu(pred_str, label_str)
+
+    return {
+        "bleu": bleu.score,
+    }
+
+# 5. Main Training Function 
+def train_model():
+    print("--- Starting Model Training (using Seq2SeqTrainer) ---")
+    config = Config()
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    image_processor = ViTImageProcessor.from_pretrained(config.ENCODER_MODEL)
+    tokenizer = BertTokenizer.from_pretrained(config.DECODER_MODEL)
+    
+    tokenizer.bos_token = tokenizer.cls_token
+    tokenizer.eos_token = tokenizer.sep_token
+    print("Processor and Tokenizer loaded.") 
+
+    model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
+        config.ENCODER_MODEL, config.DECODER_MODEL
+    ) 
+
+    model.config.decoder_start_token_id = tokenizer.bos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.decoder.is_decoder = True
+    model.config.decoder.add_cross_attention = True
+    print("Model loaded and configured.")
+
+    train_dataset = TableBankDataset(config, split="train")
+    val_dataset = TableBankDataset(config, split="val")
+
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=config.CHECKPOINT_DIR,
+        num_train_epochs=config.NUM_EPOCHS,
+        per_device_train_batch_size=config.BATCH_SIZE,
+        per_device_eval_batch_size=config.BATCH_SIZE,
+        learning_rate=config.LEARNING_RATE,
+        gradient_accumulation_steps=config.GRAD_ACCUMULATION_STEPS,
+        
+        fp16=True if device.type == 'cuda' else False, 
+        dataloader_num_workers=0,
+        dataloader_pin_memory=True,
+        
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        predict_with_generate=True,
+        
+        logging_strategy="steps",
+        logging_steps=100,
+        logging_first_step=True,
+        
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_bleu",
+        greater_is_better=True,
+        
+        push_to_hub=False,
+        remove_unused_columns=False,
+    )
+
+    trainer = Seq2SeqTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        data_collator=lambda batch: collate_fn(batch, image_processor, tokenizer),
+        compute_metrics=lambda p: compute_metrics(p, tokenizer),
+    )
+
+    print("Starting training...") 
+    trainer.train(resume_from_checkpoint=config.RESUME_FROM_CHECKPOINT)
+
+    print("\nTraining complete.")
+    print(f"Saving final model to {config.MODEL_OUTPUT_DIR}")
+    os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
+    
+    trainer.save_model(config.MODEL_OUTPUT_DIR)
+    image_processor.save_pretrained(config.MODEL_OUTPUT_DIR)
+    
+    print(f"Final model, tokenizer, and image processor saved to {config.MODEL_OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    train_model()
