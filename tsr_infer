@@ -1,0 +1,49 @@
+def run_inference_on_test_image():
+    print("\n--- Running Inference on a Single Test Image ---")
+    config = Config()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load the trained model, processor, and tokenizer
+    print(f"Loading model from {config.MODEL_OUTPUT_DIR}")
+    model = VisionEncoderDecoderModel.from_pretrained(config.MODEL_OUTPUT_DIR).to(device)
+    image_processor = ViTImageProcessor.from_pretrained(config.MODEL_OUTPUT_DIR)
+    tokenizer = BertTokenizer.from_pretrained(config.DECODER_MODEL)
+
+    # 2. Load the test dataset
+    test_dataset = TableBankDataset(config, split="test")
+    
+    # 3. Get a single valid item
+    item = None
+    idx = 0
+    while item is None:
+        item = test_dataset[idx]
+        idx += 1
+        if idx > len(test_dataset):
+            print("Error: Could not find any valid images in the test set.")
+            return
+
+    print(f"Running inference on image: {test_dataset.image_paths[idx-1]}")
+    image = item['image']
+    ground_truth_html = item['html_str']
+
+    # 4. Process the image
+    pixel_values = image_processor(images=image, return_tensors="pt").pixel_values
+    pixel_values = pixel_values.to(device)
+
+    # 5. Generate output
+    # You can change max_length to be longer if needed
+    output_ids = model.generate(pixel_values, max_length=512)
+
+    # 6. Decode the output
+    pred_html = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+    # 7. Print the comparison
+    print("\n--- PREDICTED HTML ---")
+    print(pred_html)
+    
+    print("\n--- GROUND TRUTH HTML ---")
+    print(ground_truth_html)
+
+if __name__ == "__main__":
+    train_model()
+    run_inference_on_test_image()
