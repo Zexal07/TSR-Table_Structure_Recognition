@@ -18,6 +18,8 @@ The model is trained using the TableBank dataset, a large-scale collection of im
 
 # Project Directory Structure
 The script is designed to work with the TableBank dataset. The code specifically uses the Recognition subdirectory.
+
+The dataset can be found online. Here is a link to access: [ TableBank Dataset ]( https://huggingface.co/datasets/liminghao1630/TableBank/tree/main )
 ```
 TableBank/
 |- Detection/
