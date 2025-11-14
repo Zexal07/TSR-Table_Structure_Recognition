@@ -166,12 +166,25 @@ def train_model():
     model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
         config.ENCODER_MODEL, config.DECODER_MODEL
     ) 
-
+    
     model.config.decoder_start_token_id = tokenizer.bos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
+    
+    model.decoder.config.decoder_start_token_id = tokenizer.bos_token_id
+    model.decoder.config.eos_token_id = tokenizer.eos_token_id
+    model.decoder.config.pad_token_id = tokenizer.pad_token_id
+
+    model.generation_config.decoder_start_token_id = tokenizer.bos_token_id
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
+
     model.config.decoder.is_decoder = True
     model.config.decoder.add_cross_attention = True
+    model.decoder.config.is_decoder = True
+    model.decoder.config.add_cross_attention = True
+    
+
     print("Model loaded and configured.")
 
     train_dataset = TableBankDataset(config, split="train")
@@ -193,6 +206,7 @@ def train_model():
         eval_strategy="epoch",
         save_strategy="epoch",
         predict_with_generate=True,
+        generation_max_length=512, # <-- ADDED THIS LINE
         
         logging_strategy="steps",
         logging_steps=100,
