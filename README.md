@@ -1,5 +1,5 @@
 # Table Structure Recognition (TSR) using Vision Transformers
-This project implements a **Table Structure Recognition (TSR)** model using a **Vision Transformer (ViT)** encoder and a BERT-based decoder. The primary goal is to take an image of a table as input and generate its corresponding structural representation as a sequence of HTML tokens.
+This project implements a **Table Structure Recognition (TSR)** model using a **Vision Transformer (ViT)** encoder and a GPT2-based decoder. The primary goal is to take an image of a table as input and generate its corresponding structural representation as a sequence of HTML tokens.
 
 The model is trained using the TableBank dataset, a large-scale collection of images and their corresponding HTML annotations.
 
@@ -8,7 +8,7 @@ The model is trained using the TableBank dataset, a large-scale collection of im
 
 **Encoder**: A pre-trained Vision Transformer (google/vit-base-patch16-224-in21k) processes the input table images.
 
-**Decoder**: A pre-trained BERT model (bert-base-uncased) is configured as a decoder to generate the HTML token sequence.
+**Decoder**: A pre-trained BPT2 model (GPT2) is configured as a decoder to generate the HTML token sequence.
 
 **Training**: Implements efficient training and evaluation using the Seq2SeqTrainer.
 
@@ -80,7 +80,7 @@ python train.py
 ```
 The script will:
 
-Load the pre-trained ViT image processor and BERT tokenizer.
+Load the pre-trained ViT image processor and GPT2 tokenizer.
 
 Initialize the **VisionEncoderDecoderModel**.
 
@@ -107,7 +107,7 @@ All training and model parameters can be adjusted in the Config class at the beg
 
 - ENCODER_MODEL: The Hugging Face checkpoint for the ViT encoder.
 
-- DECODER_MODEL: The Hugging Face checkpoint for the BERT decoder.
+- DECODER_MODEL: The Hugging Face checkpoint for the GPT2 decoder.
 
 *Training Hyperparameters*:
 
