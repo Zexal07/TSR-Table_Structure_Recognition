@@ -1,81 +1,86 @@
+import os
+from pathlib import Path
+from typing import Any, Dict, List
+
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from PIL import Image, ImageFile
 from transformers import (
     VisionEncoderDecoderModel,
     ViTImageProcessor,
-    BertTokenizer,
+    GPT2TokenizerFast,
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
-    EvalPrediction
+    EvalPrediction,
 )
-import os
-from pathlib import Path
+import sacrebleu
+import logging
 import warnings
-import sacrebleu  
-from typing import Optional, Dict, Any
-import logging 
 
-# Suppress warnings
 warnings.filterwarnings("ignore")
-
-logging.basicConfig(level=logging.INFO)
-
+logging.basicConfig(level=logging.WARNING)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# 1. Configuration
+
 class Config:
-    ROOT_DIR = Path("C:/Users/ahmed/Desktop/Ahmed Sajid/Office - NCV/NCV - HTR/TableBank/Recognition")
+    ROOT_DIR = Path("./TableBank/Recognition")
     IMAGE_DIR = ROOT_DIR / "Images"
     ANNOTATION_DIR = ROOT_DIR / "Annotations"
-    
-    # Model checkpoints
+
     ENCODER_MODEL = "google/vit-base-patch16-224-in21k"
-    DECODER_MODEL = "bert-base-uncased"
-    
-    # Training params
-    NUM_EPOCHS = 5
-    BATCH_SIZE = 16 
-    LEARNING_RATE = 1e-3
-    
-    # Gradient accumulation steps
-    GRAD_ACCUMULATION_STEPS = 4 
-    
-    # Data splits 
+    DECODER_MODEL = "gpt2"
+
+    NUM_EPOCHS = 3
+    BATCH_SIZE = 8
+    LEARNING_RATE = 5e-5
+    GRAD_ACCUMULATION_STEPS = 2
+
     TRAIN_SIZE = 20000
     VAL_SIZE = 1000
     TEST_SIZE = 5000
-    
-    # Model output
-    MODEL_OUTPUT_DIR = "tsr_vit_tablebank"
-    
-    # Checkpoint Configuration 
-    CHECKPOINT_DIR = "tsr_vit_tablebank_checkpoints" 
-    RESUME_FROM_CHECKPOINT: Optional[str] = None 
 
-# 2. Custom Dataset 
-class TableBankDataset(Dataset):
-    def __init__(self, config, split="train"):
+    MODEL_OUTPUT_DIR = "tsr_vit_tablebank_v1"
+    CHECKPOINT_DIR = "tsr_vit_tablebank_checkpoints"
+
+    MAX_TARGET_LENGTH = 128
+    GENERATION_MAX_LENGTH = 128
+
+
+class TableBankRD(Dataset):
+    def __init__(self, config: Config, split: str = "train"):
         self.config = config
         self.split = split
-        self.image_paths = []
-        self.html_strings = []
+        self.image_paths: List[str] = []
+        self.texts: List[str] = []
 
-        src_file = config.ANNOTATION_DIR / f"src-all_{split}.txt"
-        tgt_file = config.ANNOTATION_DIR / f"tgt-all_{split}.txt"
+        candidates = [
+            (f"src_all_{split}.txt", f"tgt_all_{split}.txt"),
+            (f"src-all_{split}.txt", f"tgt-all_{split}.txt"),
+            (f"all_{split}.txt", f"tgt_{split}.txt"),
+            (f"src_{split}.txt", f"tgt_{split}.txt"),
+            (f"src_all.txt", f"tgt_all.txt"),
+        ]
 
-        try:
-            with open(src_file, 'r', encoding='utf-8') as f:
-                all_image_paths = [line.strip() for line in f.readlines()]
-                
-            with open(tgt_file, 'r', encoding='utf-8') as f:
-                all_html_strings = [line.strip() for line in f.readlines()]
-        except FileNotFoundError as e:
-            print(f"Error: Annotation file not found. {e}")
-            raise
-        
-        assert len(all_image_paths) == len(all_html_strings), \
-            "Mismatch between image file list and HTML content list."
+        found = False
+        for src_name, tgt_name in candidates:
+            src_file = self.config.ANNOTATION_DIR / src_name
+            tgt_file = self.config.ANNOTATION_DIR / tgt_name
+            if src_file.exists() and tgt_file.exists():
+                found = True
+                break
+
+        if not found:
+            raise FileNotFoundError(
+                f"Could not find annotation files in {self.config.ANNOTATION_DIR}. Tried: {candidates}"
+            )
+
+        with open(src_file, 'r', encoding='utf-8') as f:
+            all_image_paths = [line.strip() for line in f.readlines()]
+
+        with open(tgt_file, 'r', encoding='utf-8') as f:
+            all_texts = [line.rstrip('') for line in f.readlines()]
+
+        assert len(all_image_paths) == len(all_texts), "Annotation mismatch"
 
         if split == "train":
             size_limit = min(config.TRAIN_SIZE, len(all_image_paths))
@@ -85,162 +90,168 @@ class TableBankDataset(Dataset):
             size_limit = min(config.TEST_SIZE, len(all_image_paths))
         else:
             size_limit = len(all_image_paths)
-            
+
         self.image_paths = all_image_paths[:size_limit]
-        self.html_strings = all_html_strings[:size_limit]
-        
-        print(f"{split.upper()} set: {len(self.image_paths)} images")
+        self.texts = all_texts[:size_limit]
+
+        logging.info(f"{split.upper()} set: {len(self.image_paths)} samples")
 
     def __len__(self):
         return len(self.image_paths)
 
-    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         image_name = self.image_paths[idx]
         image_path = self.config.IMAGE_DIR / image_name
         try:
             image = Image.open(image_path).convert("RGB")
-        except (FileNotFoundError, OSError, Image.DecompressionBombError) as e:
-            print(f"Warning: Could not load image {image_path}. Error: {e}. Skipping.")
-            return None 
-            
-        html_str = self.html_strings[idx]
-        return {"image": image, "html_str": html_str}
+        except Exception as e:
+            logging.warning(f"Could not load image {image_path}: {e}")
+            raise
+        text = self.texts[idx]
+        return {"image": image, "text": text}
 
-# 3. Custom Collate Function 
-def collate_fn(batch, image_processor, tokenizer):
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return {} 
 
-    images = [item['image'] for item in batch]
-    html_strs = [item['html_str'] for item in batch]
-    
-    pixel_values = image_processor(images=images, return_tensors="pt").pixel_values
-    
-    tokenized_text = tokenizer(
-        html_strs, padding="longest", truncation=True, max_length=512, return_tensors="pt"
-    )
-    
-    labels = tokenized_text.input_ids.clone()
-    labels[labels == tokenizer.pad_token_id] = -100 
-    
-    return {
-        "pixel_values": pixel_values,
-        "labels": labels,
-        "decoder_attention_mask": tokenized_text.attention_mask
-    }
+class DataCollator:
+    def __init__(self, image_processor: ViTImageProcessor, tokenizer: GPT2TokenizerFast, cfg: Config):
+        self.image_processor = image_processor
+        self.tokenizer = tokenizer
+        self.cfg = cfg
 
-# 4. Evaluation Metrics Function
-def compute_metrics(pred: EvalPrediction, tokenizer: BertTokenizer) -> Dict[str, float]:
-    preds_ids = pred.predictions
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        images = [item["image"] for item in batch]
+        texts = [item["text"] for item in batch]
+
+        pixel_values = self.image_processor(images=images, return_tensors="pt").pixel_values
+
+        tokenized = self.tokenizer(
+            texts,
+            padding='longest',
+            truncation=True,
+            max_length=self.cfg.MAX_TARGET_LENGTH,
+            return_tensors='pt'
+        )
+        labels = tokenized.input_ids
+        labels[labels == self.tokenizer.pad_token_id] = -100
+
+        return {
+            "pixel_values": pixel_values,
+            "labels": labels,
+        }
+
+
+def compute_metrics(pred: EvalPrediction, tokenizer: GPT2TokenizerFast) -> Dict[str, float]:
+    preds = pred.predictions
+    if isinstance(preds, tuple):
+        preds = preds[0]
+
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+
     label_ids = pred.label_ids
+    labels = label_ids.copy()
+    labels[labels == -100] = tokenizer.pad_token_id
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    label_ids[label_ids == -100] = tokenizer.pad_token_id
+    bleu = sacrebleu.corpus_bleu(decoded_preds, [decoded_labels])
+    return {"bleu": float(bleu.score)}
 
-    pred_str = tokenizer.batch_decode(preds_ids, skip_special_tokens=True)
-    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-    label_str = [[label] for label in label_str]
-
-    bleu = sacrebleu.corpus_bleu(pred_str, label_str)
-
-    return {
-        "bleu": bleu.score,
-    }
-
-# 5. Main Training Function 
 def train_model():
-    print("--- Starting Model Training (using Seq2SeqTrainer) ---")
-    config = Config()
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    cfg = Config()
 
-    image_processor = ViTImageProcessor.from_pretrained(config.ENCODER_MODEL)
-    tokenizer = BertTokenizer.from_pretrained(config.DECODER_MODEL)
-    
-    tokenizer.bos_token = tokenizer.cls_token
-    tokenizer.eos_token = tokenizer.sep_token
-    print("Processor and Tokenizer loaded.") 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+
+    image_processor = ViTImageProcessor.from_pretrained(cfg.ENCODER_MODEL)
+    tokenizer = GPT2TokenizerFast.from_pretrained(cfg.DECODER_MODEL)
+
+    special_tokens = {}
+    if tokenizer.pad_token is None:
+        special_tokens['pad_token'] = '<pad>'
+    if tokenizer.eos_token is None:
+        special_tokens['eos_token'] = ''
+    if tokenizer.bos_token is None:
+        special_tokens['bos_token'] = '<bos>'
+
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
 
     model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
-        config.ENCODER_MODEL, config.DECODER_MODEL
-    ) 
-    
-    model.config.decoder_start_token_id = tokenizer.bos_token_id
+        cfg.ENCODER_MODEL, cfg.DECODER_MODEL
+    )
+
+    model.decoder.resize_token_embeddings(len(tokenizer))
+
+    model.config.decoder_start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
-    
-    model.decoder.config.decoder_start_token_id = tokenizer.bos_token_id
-    model.decoder.config.eos_token_id = tokenizer.eos_token_id
-    model.decoder.config.pad_token_id = tokenizer.pad_token_id
+    model.config.vocab_size = model.config.decoder.vocab_size = len(tokenizer)
 
-    model.generation_config.decoder_start_token_id = tokenizer.bos_token_id
-    model.generation_config.eos_token_id = tokenizer.eos_token_id
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
+    model.config.is_encoder_decoder = True
+    try:
+        model.decoder.config.is_decoder = True
+        model.decoder.config.add_cross_attention = True
+    except Exception:
+        pass
 
-    model.config.decoder.is_decoder = True
-    model.config.decoder.add_cross_attention = True
-    model.decoder.config.is_decoder = True
-    model.decoder.config.add_cross_attention = True
-    
+    gen_kwargs = {
+        "max_length": cfg.GENERATION_MAX_LENGTH,
+        "num_beams": 4,
+        "early_stopping": True,
+    }
 
-    print("Model loaded and configured.")
+    train_dataset = TableBankRD(cfg, split="train")
+    val_dataset = TableBankRD(cfg, split="val")
 
-    train_dataset = TableBankDataset(config, split="train")
-    val_dataset = TableBankDataset(config, split="val")
-
+    data_collator = DataCollator(image_processor, tokenizer, cfg)
 
     training_args = Seq2SeqTrainingArguments(
-        output_dir=config.CHECKPOINT_DIR,
-        num_train_epochs=config.NUM_EPOCHS,
-        per_device_train_batch_size=config.BATCH_SIZE,
-        per_device_eval_batch_size=config.BATCH_SIZE,
-        learning_rate=config.LEARNING_RATE,
-        gradient_accumulation_steps=config.GRAD_ACCUMULATION_STEPS,
-        
-        fp16=True if device.type == 'cuda' else False, 
-        dataloader_num_workers=0,
-        dataloader_pin_memory=True,
-        
+        output_dir=cfg.CHECKPOINT_DIR,
+        num_train_epochs=cfg.NUM_EPOCHS,
+        per_device_train_batch_size=cfg.BATCH_SIZE,
+        per_device_eval_batch_size=cfg.BATCH_SIZE,
+        learning_rate=cfg.LEARNING_RATE,
+        gradient_accumulation_steps=cfg.GRAD_ACCUMULATION_STEPS,
+        fp16=True if device.type == 'cuda' else False,
+        dataloader_num_workers=0,  
+        dataloader_pin_memory=True if device.type == 'cuda' else False,
         eval_strategy="epoch",
         save_strategy="epoch",
         predict_with_generate=True,
-        generation_max_length=512, # <-- ADDED THIS LINE
-        
+        generation_max_length=cfg.GENERATION_MAX_LENGTH,
         logging_strategy="steps",
         logging_steps=100,
-        logging_first_step=True,
-        
         load_best_model_at_end=True,
-        metric_for_best_model="eval_bleu",
+        metric_for_best_model="bleu",
         greater_is_better=True,
-        
-        push_to_hub=False,
         remove_unused_columns=False,
     )
 
     trainer = Seq2SeqTrainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
-        data_collator=lambda batch: collate_fn(batch, image_processor, tokenizer),
+        data_collator=data_collator,
+        tokenizer=tokenizer,
         compute_metrics=lambda p: compute_metrics(p, tokenizer),
     )
 
-    print("Starting training...") 
-    trainer.train(resume_from_checkpoint=config.RESUME_FROM_CHECKPOINT)
+    trainer.model.config.update(gen_kwargs)
 
-    print("\nTraining complete.")
-    print(f"Saving final model to {config.MODEL_OUTPUT_DIR}")
-    os.makedirs(config.MODEL_OUTPUT_DIR, exist_ok=True)
-    
-    trainer.save_model(config.MODEL_OUTPUT_DIR)
-    image_processor.save_pretrained(config.MODEL_OUTPUT_DIR)
-    
-    print(f"Final model, tokenizer, and image processor saved to {config.MODEL_OUTPUT_DIR}")
+    try:
+        trainer.train()
+    except RuntimeError as e:
+        logging.error(f"Training failed: {e}")
+        if 'out of memory' in str(e).lower():
+            logging.error("OUT OF MEMORY. Try reducing BATCH_SIZE or GENERATION_MAX_LENGTH.")
+        raise
 
-if __name__ == "__main__":
+    os.makedirs(cfg.MODEL_OUTPUT_DIR, exist_ok=True)
+    trainer.save_model(cfg.MODEL_OUTPUT_DIR)
+    tokenizer.save_pretrained(cfg.MODEL_OUTPUT_DIR)
+    image_processor.save_pretrained(cfg.MODEL_OUTPUT_DIR)
+    logging.info(f"Saved to {cfg.MODEL_OUTPUT_DIR}")
+
+
+if __name__ == '__main__':
     train_model()
