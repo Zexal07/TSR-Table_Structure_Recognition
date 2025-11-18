@@ -1,49 +1,91 @@
-def run_inference_on_test_image():
-    print("\n--- Running Inference on a Single Test Image ---")
-    config = Config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
 
-    # 1. Load the trained model, processor, and tokenizer
-    print(f"Loading model from {config.MODEL_OUTPUT_DIR}")
-    model = VisionEncoderDecoderModel.from_pretrained(config.MODEL_OUTPUT_DIR).to(device)
-    image_processor = ViTImageProcessor.from_pretrained(config.MODEL_OUTPUT_DIR)
-    tokenizer = BertTokenizer.from_pretrained(config.DECODER_MODEL)
+import torch
+from PIL import Image
+from transformers import (
+    VisionEncoderDecoderModel,
+    ViTImageProcessor,
+    GPT2TokenizerFast
+)
 
-    # 2. Load the test dataset
-    test_dataset = TableBankDataset(config, split="test")
+MODEL_DIR = "tsr_vit_tablebank_v1" 
+MAX_LENGTH = 128
+NUM_BEAMS = 4
+
+print("Loading model...")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model = VisionEncoderDecoderModel.from_pretrained(MODEL_DIR).to(device)
+tokenizer = GPT2TokenizerFast.from_pretrained(MODEL_DIR)
+image_processor = ViTImageProcessor.from_pretrained(MODEL_DIR)
+
+model.eval()
+print("Model loaded.")
+
+def run_inference(image_path):
+    image = Image.open(image_path).convert("RGB")
     
-    # 3. Get a single valid item
-    item = None
-    idx = 0
-    while item is None:
-        item = test_dataset[idx]
-        idx += 1
-        if idx > len(test_dataset):
-            print("Error: Could not find any valid images in the test set.")
-            return
+    pixel_values = image_processor(images=image, return_tensors="pt").pixel_values.to(device)
 
-    print(f"Running inference on image: {test_dataset.image_paths[idx-1]}")
-    image = item['image']
-    ground_truth_html = item['html_str']
+    output_ids = model.generate(
+        pixel_values,
+        max_length=MAX_LENGTH,
+        num_beams=NUM_BEAMS,
+        early_stopping=True
+    )
 
-    # 4. Process the image
-    pixel_values = image_processor(images=image, return_tensors="pt").pixel_values
-    pixel_values = pixel_values.to(device)
+    prediction = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    return prediction
 
-    # 5. Generate output
-    # You can change max_length to be longer if needed
-    output_ids = model.generate(pixel_values, max_length=512)
 
-    # 6. Decode the output
-    pred_html = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+def choose_image():
+    filepath = filedialog.askopenfilename(
+        title="Select Table Image",
+        filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.tiff")]
+    )
 
-    # 7. Print the comparison
-    print("\n--- PREDICTED HTML ---")
-    print(pred_html)
+    if not filepath:
+        return
     
-    print("\n--- GROUND TRUTH HTML ---")
-    print(ground_truth_html)
+    try:
+        result = run_inference(filepath)
 
-if __name__ == "__main__":
-    train_model()
-    run_inference_on_test_image()
+        result_window = tk.Toplevel(root)
+        result_window.title("Extracted Table Structure")
+
+        print(f"\n=== Selected Image ===\n{filepath}")
+
+        file_label = tk.Label(result_window, text=f"Selected Image:\n{filepath}")
+        file_label.pack(pady=5)
+
+        img = Image.open(filepath)
+        img.thumbnail((300, 300))  
+        img_tk = ImageTk.PhotoImage(img)
+
+        img_label = tk.Label(result_window, image=img_tk)
+        img_label.image = img_tk  
+        img_label.pack(pady=10)
+
+        text_widget = tk.Text(result_window, wrap="word", height=20, width=80)
+        text_widget.pack(padx=10, pady=10)
+        text_widget.insert(tk.END, result)
+
+        print("\nExtracted HTML Tokens\n")
+        print(result)
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+
+root = tk.Tk()
+root.title("Table Structure Recognition - TSR Inference")
+
+select_btn = tk.Button(root, text="Select Table Image", command=choose_image, width=30)
+select_btn.pack(pady=20)
+
+info_label = tk.Label(root, text="Choose an image to extract its table HTML structure.")
+info_label.pack()
+
+root.mainloop()
