@@ -12,6 +12,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     Seq2SeqTrainer,
     EvalPrediction,
+    TrainerCallback,
 )
 import sacrebleu
 import logging
@@ -30,7 +31,7 @@ class Config:
     ENCODER_MODEL = "google/vit-base-patch16-224-in21k"
     DECODER_MODEL = "gpt2"
 
-    NUM_EPOCHS = 3
+    NUM_EPOCHS = 5
     BATCH_SIZE = 8
     LEARNING_RATE = 5e-5
     GRAD_ACCUMULATION_STEPS = 2
@@ -42,8 +43,8 @@ class Config:
     MODEL_OUTPUT_DIR = "tsr_vit_tablebank_v1"
     CHECKPOINT_DIR = "tsr_vit_tablebank_checkpoints"
 
-    MAX_TARGET_LENGTH = 128
-    GENERATION_MAX_LENGTH = 128
+    MAX_TARGET_LENGTH = 512
+    GENERATION_MAX_LENGTH = 256
 
 
 class TableBankRD(Dataset):
@@ -155,6 +156,33 @@ def compute_metrics(pred: EvalPrediction, tokenizer: GPT2TokenizerFast) -> Dict[
     return {"bleu": float(bleu.score)}
 
 
+class PredictionPrinterCallback(TrainerCallback):
+    def __init__(self, tokenizer, image_processor, val_dataset, cfg):
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.val_dataset = val_dataset
+        self.cfg = cfg
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        sample = self.val_dataset[0]
+        img = sample["image"]
+
+        device = model.device
+        inputs = self.image_processor(img, return_tensors="pt").pixel_values.to(device)
+
+        pred_ids = model.generate(inputs, max_length=self.cfg.GENERATION_MAX_LENGTH)
+        pred_text = self.tokenizer.decode(pred_ids[0], skip_special_tokens=False)
+
+        gt_text = sample["text"]
+
+        print("\n" + "=" * 60)
+        print(f"SAMPLE PREDICTION AFTER EPOCH {state.epoch}")
+        print("=" * 60)
+        print("MODEL OUTPUT:\n", pred_text)
+        print("\nGROUND TRUTH:\n", gt_text)
+        print("=" * 60 + "\n")
+
+
 def train_model():
     cfg = Config()
 
@@ -169,7 +197,7 @@ def train_model():
         "bos_token": "<bos>",
         "eos_token": "</s>",
     }
-    
+
     html_tokens = [
         "<table>", "</table>",
         "<thead>", "</thead>",
@@ -177,13 +205,11 @@ def train_model():
         "<tr>", "</tr>",
         "<td>", "</td>",
     ]
-    
-    special_tokens["additional_special_tokens"] = html_tokens
-    
-    tokenizer.add_special_tokens(special_tokens)
-    
-    print(f"Added {len(html_tokens)} HTML tokens. Total vocab = {len(tokenizer)}")
 
+    special_tokens["additional_special_tokens"] = html_tokens
+    tokenizer.add_special_tokens(special_tokens)
+
+    print(f"Added {len(html_tokens)} HTML tokens. Total vocab = {len(tokenizer)}")
 
     model = VisionEncoderDecoderModel.from_encoder_decoder_pretrained(
         cfg.ENCODER_MODEL, cfg.DECODER_MODEL
@@ -191,7 +217,6 @@ def train_model():
 
     model.decoder.resize_token_embeddings(len(tokenizer))
     model.decoder.lm_head.weight = model.decoder.transformer.wte.weight
-
 
     model.config.decoder_start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
@@ -216,6 +241,17 @@ def train_model():
 
     data_collator = DataCollator(image_processor, tokenizer, cfg)
 
+    print("\nTOKENIZED LABEL CHECK:")
+    sample_text = train_dataset.texts[0]
+    print("RAW LABEL:", sample_text)
+    
+    encoded = tokenizer(sample_text)
+    decoded_tokens = [tokenizer.decode([tid]) for tid in encoded.input_ids]
+    
+    print("DECODED TOKENS:")
+    print(decoded_tokens)
+    print("="*60)
+
     training_args = Seq2SeqTrainingArguments(
         output_dir=cfg.CHECKPOINT_DIR,
         num_train_epochs=cfg.NUM_EPOCHS,
@@ -224,7 +260,7 @@ def train_model():
         learning_rate=cfg.LEARNING_RATE,
         gradient_accumulation_steps=cfg.GRAD_ACCUMULATION_STEPS,
         fp16=True if device.type == 'cuda' else False,
-        dataloader_num_workers=0,  
+        dataloader_num_workers=0,
         dataloader_pin_memory=True if device.type == 'cuda' else False,
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -238,6 +274,13 @@ def train_model():
         remove_unused_columns=False,
     )
 
+    prediction_callback = PredictionPrinterCallback(
+        tokenizer, image_processor, val_dataset, cfg
+    )
+    print("FIRST 3 LABELS:")
+    for i in range(3):
+        print(f"[{i}]:", repr(train_dataset.texts[i]))
+
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
@@ -246,6 +289,7 @@ def train_model():
         data_collator=data_collator,
         tokenizer=tokenizer,
         compute_metrics=lambda p: compute_metrics(p, tokenizer),
+        callbacks=[prediction_callback],
     )
 
     trainer.model.config.update(gen_kwargs)
@@ -266,4 +310,5 @@ def train_model():
 
 
 if __name__ == '__main__':
+    
     train_model()
