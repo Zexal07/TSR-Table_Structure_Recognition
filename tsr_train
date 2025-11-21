@@ -13,6 +13,7 @@ from transformers import (
     Seq2SeqTrainer,
     EvalPrediction,
     TrainerCallback,
+    AutoTokenizer,
 )
 import sacrebleu
 import logging
@@ -29,7 +30,7 @@ class Config:
     ANNOTATION_DIR = ROOT_DIR / "Annotations"
 
     ENCODER_MODEL = "google/vit-base-patch16-224-in21k"
-    DECODER_MODEL = "gpt2"
+    DECODER_MODEL = "facebook/bart-base"
 
     NUM_EPOCHS = 5
     BATCH_SIZE = 8
@@ -113,7 +114,7 @@ class TableBankRD(Dataset):
 
 
 class DataCollator:
-    def __init__(self, image_processor: ViTImageProcessor, tokenizer: GPT2TokenizerFast, cfg: Config):
+    def __init__(self, image_processor: ViTImageProcessor, tokenizer: AutoTokenizer, cfg: Config):
         self.image_processor = image_processor
         self.tokenizer = tokenizer
         self.cfg = cfg
@@ -140,7 +141,7 @@ class DataCollator:
         }
 
 
-def compute_metrics(pred: EvalPrediction, tokenizer: GPT2TokenizerFast) -> Dict[str, float]:
+def compute_metrics(pred: EvalPrediction, tokenizer: AutoTokenizer) -> Dict[str, float]:
     preds = pred.predictions
     if isinstance(preds, tuple):
         preds = preds[0]
@@ -190,7 +191,7 @@ def train_model():
     logging.info(f"Using device: {device}")
 
     image_processor = ViTImageProcessor.from_pretrained(cfg.ENCODER_MODEL)
-    tokenizer = GPT2TokenizerFast.from_pretrained(cfg.DECODER_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.DECODER_MODEL)
 
     special_tokens = {
         "pad_token": "<pad>",
@@ -218,7 +219,7 @@ def train_model():
     model.decoder.resize_token_embeddings(len(tokenizer))
     model.decoder.lm_head.weight = model.decoder.transformer.wte.weight
 
-    model.config.decoder_start_token_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
+    model.config.decoder_start_token_id = tokenizer.eos_token_id 
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.vocab_size = model.config.decoder.vocab_size = len(tokenizer)
@@ -241,16 +242,52 @@ def train_model():
 
     data_collator = DataCollator(image_processor, tokenizer, cfg)
 
-    print("\nTOKENIZED LABEL CHECK:")
-    sample_text = train_dataset.texts[0]
-    print("RAW LABEL:", sample_text)
+    print("\n== MODEL CONFIG CHECK ==")
+    print("decoder.is_decoder:", getattr(model.decoder.config, "is_decoder", None))
+    print("decoder.add_cross_attention:", getattr(model.decoder.config, "add_cross_attention", None))
+    print("model.config.decoder_start_token_id:", model.config.decoder_start_token_id)
+    print("model.config.pad_token_id:", model.config.pad_token_id)
+    print("model.config.eos_token_id:", model.config.eos_token_id)
+    print("model.config.vocab_size:", model.config.vocab_size)
+    print("tokenizer.bos_token_id, pad, eos:", tokenizer.bos_token_id, tokenizer.pad_token_id, tokenizer.eos_token_id)
+    print("=" * 60)
     
-    encoded = tokenizer(sample_text)
-    decoded_tokens = [tokenizer.decode([tid]) for tid in encoded.input_ids]
+    from torch.utils.data import DataLoader
+    debug_loader = DataLoader(train_dataset, batch_size=min(4, len(train_dataset)), shuffle=False, num_workers=0, collate_fn=data_collator)
     
-    print("DECODED TOKENS:")
-    print(decoded_tokens)
-    print("="*60)
+    try:
+        batch = next(iter(debug_loader))
+    except Exception as e:
+        print("ERROR building debug batch:", e)
+        batch = None
+    
+    if batch is not None:
+        pv = batch.get("pixel_values")
+        labels = batch.get("labels")
+        print("\n== BATCH CHECK ==")
+        if pv is not None:
+            print("pixel_values shape:", pv.shape, "dtype:", pv.dtype, "min/max:", pv.min().item(), pv.max().item())
+        else:
+            print("pixel_values: None")
+    
+        if labels is not None:
+            print("labels shape:", labels.shape)
+            first_labels = labels[0].cpu().numpy()
+            num_masked = (first_labels == -100).sum()
+            print("first seq length:", len(first_labels), "masked (-100) count:", int(num_masked))
+            import numpy as np
+            labels_vis = first_labels.copy()
+            labels_vis[labels_vis == -100] = tokenizer.pad_token_id
+            print("decoded first label (partial):", tokenizer.decode([int(x) for x in labels_vis if x != tokenizer.pad_token_id][:120], skip_special_tokens=False))
+        else:
+            print("labels: None")
+        print("=" * 60)
+    
+    print("Example label token count:", len(tokenizer(train_dataset.texts[0]).input_ids))
+    print("=" * 60, "\n")
+
+    print(len(tokenizer(train_dataset.texts[0]).input_ids))
+
 
     training_args = Seq2SeqTrainingArguments(
         output_dir=cfg.CHECKPOINT_DIR,
